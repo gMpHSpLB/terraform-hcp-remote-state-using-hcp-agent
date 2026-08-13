@@ -1,0 +1,47 @@
+# Secrets and local environment files
+.secrets
+.secrets/
+*.secret
+*.secrets
+.env
+.env.*
+!.env.example
+
+# Build and downloaded artifacts
+dist/
+downloads/
+*.tgz
+
+# Terraform local working directories
+.terraform/
+**/.terraform/
+
+# Terraform state files
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Terraform plan files
+*.tfplan
+tfplan-*
+**/tfplan-*
+
+# Terraform crash logs
+crash.log
+crash.*.log
+
+# Terraform override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Terraform CLI configuration
+.terraformrc
+terraform.rc
+
+# Automated Terraform artifacts
+platform-infra/.artifacts/
+
+# Local kubeconfig and Kubernetes client credentials
+tfc-agent-kube/

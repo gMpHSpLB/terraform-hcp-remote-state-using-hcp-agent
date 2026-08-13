@@ -1,0 +1,152 @@
+SHELL := /bin/bash
+
+.DEFAULT_GOAL := help
+
+# ------------------------------------------------------------------------------
+# Global settings
+# ------------------------------------------------------------------------------
+RED    := \033[1;31m
+YELLOW := \033[1;33m
+GREEN  := \033[1;32m
+CYAN   := \033[1;36m
+RESET  := \033[0m
+# ------------------------Minikube ------------------------------
+# Default minikube profile name.
+# A profile is like a named cluster configuration stored by minikube.
+# Use this if you want multiple local clusters on the same machine.
+MINIKUBE_PROFILE 		?= minikube
+
+# Docker driver means minikube runs Kubernetes inside a Docker container.
+# Best for WSL2 + Docker Desktop setups like yours.
+MINIKUBE_DRIVER  		?= docker
+
+# Memory allocated to the minikube cluster, in MB.
+# 6144 = 6 GB because 1 GB = 1024 MB in binary units.
+MINIKUBE_MEMORY  		?= 6144
+
+# Number of CPU cores assigned to minikube.
+# Increase for heavier workloads, decrease if your laptop is under pressure.
+MINIKUBE_CPUS    		?= 4
+
+MINIKUBE_DISK_SIZE 		?= 30g
+
+MINIKUBE_K8S_VERSION 	?= v1.35.4
+
+CNI_PLUGIN		 		?= calico
+
+# Default namespace for kubectl commands.
+# If not set on the command line, it uses "default".
+NAMESPACE        		?= default
+
+# ------------------------------------------------------------------------------
+# Help
+# ------------------------------------------------------------------------------
+.PHONY: help
+help: ## Show all available targets with short descriptions.
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make <target> [TF_ENV=dev|staging|prod]\n\nTargets:\n"} /^[a-zA-Z0-9_.-]+:.*##/ { printf "  %-40s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+
+
+
+# Use this when you want to start the cluster manually, even if it is already stopped.
+# The driver, memory, and CPU settings control how the cluster is created.
+# driver=docker means minikube runs inside Docker (works perfectly in WSL2)
+# Expected output: minikube startup logs and a success message when Kubernetes is ready.
+start-minikube: ## Start minikube explicitly with Calico (recommended for NetworkPolicy)
+	@minikube start \
+        --profile=$(MINIKUBE_PROFILE) \
+        --driver=$(MINIKUBE_DRIVER) \
+        --memory=$(MINIKUBE_MEMORY) \
+        --cpus=$(MINIKUBE_CPUS) \
+        --disk-size=$(MINIKUBE_DISK_SIZE) \
+		--network-plugin=cni \
+		--cni=$(CNI_PLUGIN) \
+        --kubernetes-version=$(MINIKUBE_K8S_VERSION)
+	@minikube update-context -p $(MINIKUBE_PROFILE)
+
+	@echo "What just happened: minikube created a single-node Kubernetes \
+	cluster running inside a Docker container in your WSL2 environment. \
+	That node runs both the control plane (API server, scheduler, etcd, controller manager)\
+	and will host your workloads."
+
+stop-minikube: ## Stop minikube safely.
+	# Use this when you want to pause the cluster and free local resources.
+	# This keeps the profile and data, but stops the running cluster.
+	# Expected output: cluster stop confirmation.
+	@minikube stop -p $(MINIKUBE_PROFILE) || true
+
+# Use this before kubectl or app deployment targets.
+# It checks whether the apiserver is Running, and starts minikube only if needed.
+# This avoids restarting an already working cluster.
+# Expected output: either "Minikube not ready, starting..." or nothing except kubeconfig refresh.
+ensure-minikube: ## Start minikube only if the cluster is not ready.
+	@echo "Checking minikube status..."
+	@set -e; \
+	if ! minikube status -p $(MINIKUBE_PROFILE) 2>/dev/null | grep -q "apiserver: Running"; then \
+	    echo "Minikube not ready, starting..."; \
+        $(MAKE) -f Makefile_Setup start-minikube; \
+    fi
+
+# Verify the cluster is running
+# Expected output:
+# Kubernetes control plane is running at https://192.168.49.2:8443
+# CoreDNS is running at https
+check-clusterinfo: ## Verify the cluster is running
+	@kubectl cluster-info
+
+# Use this to verify the cluster is healthy after starting minikube.
+# If minikube is working, you should see the minikube node listed here.
+# Expected output: a node table with minikube in Ready state.
+# NAME           STATUS   ROLES           AGE   VERSION
+# k8s-learning   Ready    control-plane   1m    v1.29.0
+kubectl-get-nodes: ensure-minikube ## List Kubernetes nodes.
+	@kubectl get nodes
+
+enable-minikube-addons: ## enable ingress and metrics-server
+	@echo "Enable the ingress addon"
+	minikube addons enable ingress --profile=$(MINIKUBE_PROFILE)
+
+	@echo "Enable metrics-server — needed for kubectl top"
+	minikube addons enable metrics-server --profile=$(MINIKUBE_PROFILE)
+
+	@echo "Verify addons"
+	minikube addons list --profile=$(MINIKUBE_PROFILE) | grep -E "ingress|metrics"
+
+install-helm-3-18:
+	bash ./install_helm_3_18.sh
+	helm version
+
+# -------------------------------------------------------------------------------------------------------------
+# 						Terraform CLI installation and verification (Ubuntu/WSL)
+# -------------------------------------------------------------------------------------------------------------
+.PHONY: tf-verify-installed
+tf-verify-installed: ## Verify Terraform installation and show version and basic commands.
+	@printf '$(CYAN)%s$(RESET)\n' "Checking Terraform CLI version..."; \
+	if command -v terraform >/dev/null 2>&1; then \
+		terraform version; \
+		printf '$(CYAN)%s$(RESET)\n' "Running 'terraform -help' to show available commands..."; \
+		terraform -help | head -n 20; \
+		printf '$(GREEN)%s$(RESET)\n' "Terraform CLI looks healthy."; \
+	else \
+		printf '$(GREEN)%s$(RESET)\n' "Terraform CLI not found in PATH."; \
+	fi
+
+.PHONY: tf-install-latest
+tf-install-latest: ## Force install latest Terraform via HashiCorp apt (Ubuntu/WSL).
+	@printf '$(CYAN)%s$(RESET)\n' "Adding HashiCorp apt repository and installing latest Terraform..."; \
+	sudo apt-get update && sudo apt-get install -y gnupg software-properties-common; \
+	wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null; \
+	echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $$("lsb_release" -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list > /dev/null; \
+	sudo apt-get update && sudo apt-get install -y terraform; \
+	printf '$(GREEN)%s$(RESET)\n' "Terraform installed via apt. Verifying version..."; \
+	$(MAKE) -f Makefile_Setup tf-verify-installed
+
+.PHONY: tf-ensure-installed
+tf-ensure-installed: ## Ensure Terraform is installed; install via apt if missing.
+	@printf '$(CYAN)%s$(RESET)\n' "Ensuring Terraform CLI is installed..."; \
+	if command -v terraform >/dev/null 2>&1; then \
+		printf '$(GREEN)%s$(RESET)\n' "Terraform already installed. Skipping apt install."; \
+	else \
+		printf '$(CYAN)%s$(RESET)\n' "Terraform not found. Installing via HashiCorp apt repository..."; \
+		$(MAKE) -f Makefile_Setup tf-install-latest ;\
+	fi
+

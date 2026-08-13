@@ -1,0 +1,282 @@
+###############################################################################
+# TF-02: HCP Terraform Agent + Minikube
+#
+# Expected setup:
+# - Minikube uses the Docker driver.
+# - Minikube container is named "minikube".
+# - HCP Terraform agent token is exported:
+#
+#     export TFC_AGENT_TOKEN="your-agent-pool-token"
+#
+# Main workflow:
+#
+#     make tf-agent-prepare-minikube
+#     make tf-agent-test-minikube
+#     make tf-agent-start
+#
+#
+# | Target                         | Responsibility                                                     | Requires                    |
+# | ------------------------------ | ------------------------------------------------------------------ | --------------------------- |
+# | tf-agent-check-tools           | Checks Docker, kubectl, Minikube, Terraform, and Docker daemon     | Local tools                 |
+# | tf-agent-check-token           | Verifies TFC_AGENT_TOKEN exists                                    | Exported token              |
+# | tf-agent-check-minikube        | Confirms Minikube and its Docker container are running             | Minikube                    |
+# | tf-agent-show-minikube-network | Displays Minikube IP, network, and ports                           | Running Minikube            |
+# | tf-agent-prepare-kubeconfig    | Creates container-compatible kubeconfig with embedded certificates | Minikube and kubectl        |
+# | tf-agent-show-kubeconfig       | Displays the API endpoint without exposing certificates            | Prepared kubeconfig         |
+# | tf-agent-test-minikube         | Tests Docker-to-Minikube access using kubectl get nodes            | Prepared kubeconfig         |
+# | tf-agent-start                 | Starts the HCP Terraform agent in the foreground                   | Token, Minikube, kubeconfig |
+# | tf-agent-stop                  | Removes the agent container                                        | Docker                      |
+# | tf-agent-status                | Shows agent container status                                       | Docker                      |
+# | tf-agent-clean-kubeconfig      | Deletes generated authentication files                             | Local filesystem            |
+# | tf-agent-workflow              | Runs the preparation and connectivity checks in order              | All prerequisites           |
+#
+###############################################################################
+
+.PHONY: \
+	tf-agent-check-tools \
+	tf-agent-check-token \
+	tf-agent-check-minikube \
+	tf-agent-show-minikube-network \
+	tf-agent-prepare-kubeconfig \
+	tf-agent-show-kubeconfig \
+	tf-agent-test-minikube \
+	tf-agent-start \
+	tf-agent-stop \
+	tf-agent-status \
+	tf-agent-clean-kubeconfig \
+	tf-agent-workflow
+
+###############################################################################
+# Configuration
+###############################################################################
+
+MINIKUBE_CONTAINER 				?= minikube
+MINIKUBE_NETWORK 				?= minikube
+MINIKUBE_API_PORT 				?= 8443
+
+TFC_AGENT_IMAGE 				?= hashicorp/tfc-agent:1.30.1
+TFC_AGENT_NAME 					?= minikube-wsl-agent
+TFC_AGENT_CONTAINER 			?= hcp-agent-minikube
+
+# Directory used to exchange the kubeconfig with Docker containers.
+TFC_AGENT_KUBE_DIR 				?= $(HOME)/tfc-agent-kube
+
+# Main kubeconfig with embedded certificates.
+TFC_AGENT_KUBECONFIG 			?= $(TFC_AGENT_KUBE_DIR)/config
+
+# Readable copy used by the HCP agent container.
+#
+# This file contains Kubernetes client authentication material. It must not
+# be committed to Git.
+TFC_AGENT_AGENT_CONFIG 			?= $(TFC_AGENT_KUBE_DIR)/agent-config
+
+###############################################################################
+# 1. Check local prerequisites
+###############################################################################
+
+tf-agent-check-tools: ## Check Docker, kubectl, Minikube, and Terraform tools.
+	@printf '$(CYAN)%s$(RESET)\n' "Checking required tools..."; \
+	for tool in docker kubectl minikube terraform; do \
+		if command -v "$$tool" >/dev/null 2>&1; then \
+			printf '$(GREEN)%s$(RESET)\n' "$$tool: available"; \
+		else \
+			printf '$(RED)%s$(RESET)\n' "$$tool: not found"; \
+			exit 1; \
+		fi; \
+	done; \
+	if docker info >/dev/null 2>&1; then \
+		printf '$(GREEN)%s$(RESET)\n' "Docker daemon: available"; \
+	else \
+		printf '$(RED)%s$(RESET)\n' "Docker daemon: unavailable"; \
+		exit 1; \
+	fi
+
+###############################################################################
+# 2. Check the HCP Terraform agent token
+###############################################################################
+
+tf-agent-check-token: ## Verify that TFC_AGENT_TOKEN is exported.
+	@printf '$(CYAN)%s$(RESET)\n' "Checking TFC_AGENT_TOKEN..."; \
+	if [ -n "$$TFC_AGENT_TOKEN" ]; then \
+		printf '$(GREEN)%s$(RESET)\n' "TFC_AGENT_TOKEN is present."; \
+	else \
+		printf '$(RED)%s$(RESET)\n' "TFC_AGENT_TOKEN is missing."; \
+		printf '%s\n' "Run: export TFC_AGENT_TOKEN=\"your-agent-pool-token\""; \
+		exit 1; \
+	fi
+
+###############################################################################
+# 3. Check Minikube
+###############################################################################
+
+tf-agent-check-minikube: ## Verify that Minikube and its Docker container are running.
+	@printf '$(CYAN)%s$(RESET)\n' "Checking Minikube status..."; \
+	if ! minikube status >/dev/null 2>&1; then \
+		printf '$(RED)%s$(RESET)\n' "Minikube is not running."; \
+		printf '%s\n' "Start it with: minikube start --driver=docker"; \
+		exit 1; \
+	fi; \
+	if docker inspect "$(MINIKUBE_CONTAINER)" >/dev/null 2>&1; then \
+		printf '$(GREEN)%s$(RESET)\n' "Minikube Docker container exists."; \
+	else \
+		printf '$(RED)%s$(RESET)\n' "Docker container '$(MINIKUBE_CONTAINER)' was not found."; \
+		exit 1; \
+	fi; \
+	minikube status
+
+###############################################################################
+# 4. Show Minikube Docker networking
+###############################################################################
+
+tf-agent-show-minikube-network: tf-agent-check-minikube ## Show Minikube IP, Docker network, and published ports.
+	@printf '$(CYAN)%s$(RESET)\n' "Minikube Docker network details:"; \
+	docker inspect "$(MINIKUBE_CONTAINER)" \
+		--format '{{range $$name, $$network := .NetworkSettings.Networks}}{{$$name}}: {{$$network.IPAddress}}{{"\n"}}{{end}}'; \
+	printf '$(CYAN)%s$(RESET)\n' "Minikube published ports:"; \
+	docker port "$(MINIKUBE_CONTAINER)"
+
+###############################################################################
+# 5. Prepare the container-compatible kubeconfig
+###############################################################################
+tf-agent-prepare-kubeconfig: \
+	tf-agent-check-tools \
+	tf-agent-check-minikube \
+	tf-agent-show-minikube-network
+	@printf '$(CYAN)%s$(RESET)\n' "Preparing container-compatible kubeconfig..."; \
+	mkdir -p "$(TFC_AGENT_KUBE_DIR)"; \
+	MINIKUBE_IP="$$(docker inspect "$(MINIKUBE_CONTAINER)" \
+		--format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+		| head -n 1)"; \
+	if [ -z "$$MINIKUBE_IP" ]; then \
+		printf '$(RED)%s$(RESET)\n' "Could not determine the Minikube container IP."; \
+		exit 1; \
+	fi; \
+	printf '$(CYAN)%s$(RESET)\n' "Minikube container IP: $$MINIKUBE_IP"; \
+	kubectl config view \
+		--raw \
+		--minify \
+		--flatten \
+		> "$(TFC_AGENT_KUBECONFIG)"; \
+	kubectl config set-cluster minikube \
+		--kubeconfig="$(TFC_AGENT_KUBECONFIG)" \
+		--server="https://$$MINIKUBE_IP:$(MINIKUBE_API_PORT)" \
+		>/dev/null; \
+	chmod 755 "$(TFC_AGENT_KUBE_DIR)"; \
+	chmod 644 "$(TFC_AGENT_KUBECONFIG)"; \
+	cp "$(TFC_AGENT_KUBECONFIG)" "$(TFC_AGENT_AGENT_CONFIG)"; \
+	chmod 644 "$(TFC_AGENT_AGENT_CONFIG)"; \
+	printf '$(GREEN)%s$(RESET)\n' "Kubeconfig prepared and readable by the agent container."
+
+###############################################################################
+# 6. Inspect the generated kubeconfig safely
+###############################################################################
+
+tf-agent-show-kubeconfig: ## Show kubeconfig endpoint without exposing certificates or keys.
+	@if [ ! -f "$(TFC_AGENT_KUBECONFIG)" ]; then \
+		printf '$(RED)%s$(RESET)\n' "Kubeconfig not found."; \
+		printf '%s\n' "Run: make tf-agent-prepare-kubeconfig"; \
+		exit 1; \
+	fi; \
+	printf '$(CYAN)%s$(RESET)\n' "Kubeconfig endpoint:"; \
+	kubectl config view \
+		--kubeconfig="$(TFC_AGENT_KUBECONFIG)" \
+		--minify \
+		-o jsonpath='{.clusters[0].cluster.server}'; \
+	printf '\n'; \
+	printf '$(CYAN)%s$(RESET)\n' "Kubeconfig certificate fields:"; \
+	kubectl config view \
+		--kubeconfig="$(TFC_AGENT_KUBECONFIG)" \
+		--minify \
+		-o jsonpath='{.clusters[0].cluster.certificate-authority-data}'; \
+	printf '\n'; \
+	printf '%s\n' "The certificate value is intentionally not displayed."
+
+###############################################################################
+# 7. Test Kubernetes access from a Docker container
+###############################################################################
+
+tf-agent-test-minikube: \
+	tf-agent-prepare-kubeconfig \
+	## Test kubectl access to Minikube from a Docker container.
+	@printf '$(CYAN)%s$(RESET)\n' "Testing Kubernetes access from Docker..."; \
+	docker run --rm \
+		--user "$$(id -u):$$(id -g)" \
+		--network "$(MINIKUBE_NETWORK)" \
+		-v "$(TFC_AGENT_KUBE_DIR):/home/tfc-agent/.kube:ro" \
+		-e KUBECONFIG=/home/tfc-agent/.kube/config \
+		bitnami/kubectl:latest \
+		get nodes; \
+	printf '$(GREEN)%s$(RESET)\n' "Docker-to-Minikube Kubernetes test passed."
+
+###############################################################################
+# 8. Start the HCP Terraform agent
+###############################################################################
+tf-agent-start: \
+	tf-agent-check-tools \
+	tf-agent-check-token \
+	tf-agent-check-minikube \
+	tf-agent-prepare-kubeconfig
+	@printf '$(GREEN)%s$(RESET)\n' "Note 1: Make sure you export TFC_AGENT_TOKEN before running it."
+	@printf '$(GREEN)%s$(RESET)\n' "Note 2: After successfully running this "tf-agent-start"
+	@printf '$(GREEN)%s$(RESET)\n' "		on another terminal, run make tf-workflow-with-hcp-terraform-as-remote-backend-for-state-init-plan-apply-verify-destroy."
+	@docker rm -f "$(TFC_AGENT_CONTAINER)" >/dev/null 2>&1 || true; \
+	docker run --rm \
+		--name "$(TFC_AGENT_CONTAINER)" \
+		--network "$(MINIKUBE_NETWORK)" \
+		-e TFC_AGENT_TOKEN \
+		-e TFC_AGENT_NAME="$(TFC_AGENT_NAME)" \
+		-e KUBECONFIG=/home/tfc-agent/.kube/config \
+		-v "$(TFC_AGENT_KUBE_DIR):/home/tfc-agent/.kube:ro" \
+		"$(TFC_AGENT_IMAGE)"
+
+###############################################################################
+# 9. Stop an agent started in detached mode
+###############################################################################
+
+tf-agent-stop: ## Stop the HCP Terraform agent container if it is running.
+	@printf '$(CYAN)%s$(RESET)\n' "Stopping HCP Terraform agent..."; \
+	docker rm -f "$(TFC_AGENT_CONTAINER)" >/dev/null 2>&1 || true; \
+	printf '$(GREEN)%s$(RESET)\n' "HCP Terraform agent stopped."
+
+###############################################################################
+# 10. Show agent container status
+###############################################################################
+
+tf-agent-status: ## Show the HCP Terraform agent container status.
+	@docker ps -a \
+		--filter "name=$(TFC_AGENT_CONTAINER)" \
+		--format 'table {{.Names}}\t{{.Status}}\t{{.Networks}}'
+
+###############################################################################
+# 11. Delete generated kubeconfig files
+# 	One security note: the agent-config file is made readable by the container’s 
+# 	internal user. It is suitable for this local lab, but keep tfc-agent-kube/ 
+# 	outside source control and remove it after the experiment with.
+###############################################################################
+
+tf-agent-clean-kubeconfig: ## Delete generated container kubeconfig files.
+	@printf '$(CYAN)%s$(RESET)\n' "Deleting generated agent kubeconfig files..."; \
+	rm -rf "$(TFC_AGENT_KUBE_DIR)"; \
+	printf '$(GREEN)%s$(RESET)\n' "Generated kubeconfig files deleted."
+
+###############################################################################
+# 12. Complete guided workflow
+###############################################################################
+
+tf-agent-workflow: ## Prepare kubeconfig, test Minikube, then explain next agent step.
+	@printf '$(CYAN)%s$(RESET)\n' "TF-02 HCP Agent + Minikube workflow"; \
+	printf '%s\n' ""; \
+	printf '%s\n' "Step 1: Checking tools and Minikube."; \
+	$(MAKE) -f Makefile_HCP_Agent_Setup tf-agent-check-tools; \
+	$(MAKE) -f Makefile_HCP_Agent_Setup tf-agent-check-minikube; \
+	printf '%s\n' ""; \
+	printf '%s\n' "Step 2: Preparing embedded kubeconfig."; \
+	$(MAKE) -f Makefile_HCP_Agent_Setup tf-agent-prepare-kubeconfig; \
+	printf '%s\n' ""; \
+	printf '%s\n' "Step 3: Testing kubectl from Docker."; \
+	$(MAKE) -f Makefile_HCP_Agent_Setup tf-agent-test-minikube; \
+	printf '%s\n' ""; \
+	printf '$(GREEN)%s$(RESET)\n' "TF-02 container connectivity test passed."; \
+	printf '%s\n' ""; \
+	printf '%s\n' "Next step: start the HCP agent in another terminal:"; \
+	printf '%s\n' "  make -f Makefile_HCP_Agent_Setup tf-agent-start"

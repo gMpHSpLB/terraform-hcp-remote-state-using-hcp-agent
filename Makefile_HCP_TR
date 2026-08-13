@@ -1,0 +1,245 @@
+SHELL := /bin/bash
+
+.DEFAULT_GOAL := help
+
+RED    := \033[1;31m
+YELLOW := \033[1;33m
+GREEN  := \033[1;32m
+CYAN   := \033[1;36m
+RESET  := \033[0m
+
+# ------------------------------------------------------------------------------
+# Global settings
+# ------------------------------------------------------------------------------
+
+# TF_ENV selects which environment directory to operate on.
+# We default to "dev" because that's your first playground.
+TF_ENV ?= dev
+
+# Root directory for all environment-specific Terraform root modules.
+TF_ROOT_DIR := platform-infra/environments
+
+# Fully-qualified directory for the currently selected environment.
+TF_DIR := $(TF_ROOT_DIR)/$(TF_ENV)
+
+# ------------------------------------------------------------------------------
+# Help
+# ------------------------------------------------------------------------------
+.PHONY: help
+help: ## Show all available targets with short descriptions.
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make <target> [TF_ENV=dev|staging|prod]\n\nTargets:\n"} /^[a-zA-Z0-9_.-]+:.*##/ { printf "  %-40s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+
+# Log in to HCP Terraform from CLI
+.PHONY: tf-login-cloud
+tf-login-cloud: ## Ensure HCP Terraform CLI auth; reuse existing token if present, otherwise run 'terraform login'.
+	@printf '$(CYAN)%s$(RESET)\n' "Ensuring Terraform CLI is authorized with HCP Terraform..."; \
+	if ! command -v terraform >/dev/null 2>&1; then \
+		printf '$(RED)%s$(RESET)\n' "terraform CLI not found in PATH. Run 'make tf-ensure-installed' first."; \
+		exit 1; \
+	fi; \
+	if [ -f "$$HOME/.terraform.d/credentials.tfrc.json" ]; then \
+		printf '$(GREEN)%s$(RESET)\n' "Existing HCP Terraform credentials found at $$HOME/.terraform.d/credentials.tfrc.json."; \
+		printf '$(CYAN)%s$(RESET)\n' "Terraform CLI is already authorized. Skipping 'terraform login'."; \
+	else \
+		printf '$(CYAN)%s$(RESET)\n' "No HCP Terraform credentials file found. Running 'terraform login'..."; \
+		terraform login; \
+		printf '$(CYAN)%s$(RESET)\n' "Re-checking for saved credentials in $$HOME/.terraform.d/credentials.tfrc.json..."; \
+		if [ -f "$$HOME/.terraform.d/credentials.tfrc.json" ]; then \
+			printf '$(GREEN)%s$(RESET)\n' "HCP Terraform token found. CLI is now authorized."; \
+		else \
+			printf '$(RED)%s$(RESET)\n' "Still no credentials.tfrc.json file found. Please check the 'terraform login' output."; \
+			exit 1; \
+		fi; \
+	fi
+
+# ----------------------------------------------------------------------------------------------------------------------------------
+# Sanity checks
+# - tf-check-env
+#   	- Verifies `environments/<TF_ENV>` exists.
+#   	- Fails fast if you typo the environment (e.g. `prd` vs `prod`) instead of running Terraform in a wrong folder.
+# ----------------------------------------------------------------------------------------------------------------------------------
+.PHONY: tf-check-env-specific-tf-dir-as-tf-root-module
+tf-check-env-specific-tf-dir-as-tf-root-module: ## Internal: validate that TF_DIR exists and looks like a Terraform root module.
+	@if [ ! -d "$(TF_DIR)" ]; then \
+	  printf '$(RED)%s$(RESET)\n' "ERROR: $(TF_DIR) does not exist. Did you create the environment folders?"; \
+	  printf '$(YELLOW)%s$(RESET)\n' "Hint: expected structure: platform-infra/environments/$(TF_ENV)/main.tf"; \
+	  exit 1; \
+	fi; \
+	if [ ! -f "$(TF_DIR)/main.tf" ]; then \
+	  printf '$(RED)%s$(RESET)\n' "ERROR: $(TF_DIR)/main.tf not found. This should be your root module entrypoint."; \
+	  exit 1; \
+	fi
+
+.PHONY: tf-init
+tf-init: tf-check-env-specific-tf-dir-as-tf-root-module ## Initialize Terraform in the selected environment.
+	@printf '$(CYAN)%s$(RESET)\n' "Running terraform init in $(TF_DIR)..."
+	cd $(TF_DIR) && terraform init
+
+.PHONY: tf-fmt
+tf-fmt: ## Format Terraform files in the selected environment and modules.
+	@printf '$(CYAN)%s$(RESET)\n' "Formatting Terraform files..."
+	terraform fmt -recursive platform-infra
+
+.PHONY: tf-validate
+tf-validate: ## Validate the selected environment configuration.
+	@printf '$(CYAN)%s$(RESET)\n' "Validating Terraform in $(TF_DIR)..."
+	cd $(TF_DIR) && terraform validate
+
+.PHONY: tf-plan
+tf-plan: ## Plan the selected environment using terraform.tfvars.
+	@printf '$(CYAN)%s$(RESET)\n' "Planning Terraform in $(TF_DIR)..."
+	cd $(TF_DIR) && terraform plan -var-file=terraform.tfvars
+
+.PHONY: tf-apply
+tf-apply: ## Apply the selected environment using terraform.tfvars.
+	@printf '$(CYAN)%s$(RESET)\n' "Applying Terraform in $(TF_DIR)..."
+	cd $(TF_DIR) && terraform apply -var-file=terraform.tfvars
+
+.PHONY: tf-output
+tf-output: ## Show Terraform outputs for the selected environment.
+	@printf '$(CYAN)%s$(RESET)\n' "Showing Terraform outputs for $(TF_ENV)..."
+	cd $(TF_DIR) && terraform output
+
+.PHONY: tf-state-list
+tf-state-list: ## List resources in Terraform state for the selected environment.
+	@printf '$(CYAN)%s$(RESET)\n' "Listing Terraform state resources for $(TF_ENV)..."
+	cd $(TF_DIR) && terraform state list
+
+# Expected resources/outputs for this tutorial
+# EXPECTED_OUTPUTS ?= vpc_id cluster_name \
+# 					environment_name \
+# 					environment_id_hex \
+# 					environment_id_base64url
+
+EXPECTED_OUTPUTS ?= vpc_id cluster_name
+
+EXPECTED_STATE ?= \
+    module.network.random_pet.vpc_name \
+    module.network.random_id.vpc_id \
+    module.cluster.random_pet.cluster_name \
+    kubernetes_namespace.imported \
+    local_file.imported_file \
+    module.network.local_file.network_manifest \
+    module.cluster.local_file.cluster_manifest
+
+.PHONY: tf-verify-output
+tf-verify-output: ## Fail if expected Terraform outputs are missing.
+	@printf '$(CYAN)%s$(RESET)\n' "Verifying Terraform outputs for $(TF_ENV)..."
+	@set -e; \
+	cd $(TF_DIR); \
+	out="$$(terraform output -json 2>/dev/null || true)"; \
+	for name in $(EXPECTED_OUTPUTS); do \
+		echo "$$out" | grep -q "\"$$name\"" || { \
+			printf '$(RED)%s$(RESET)\n' "Missing expected output: $$name"; \
+			exit 1; \
+		}; \
+	done; \
+	printf '$(GREEN)%s$(RESET)\n' "All expected outputs are present."
+
+.PHONY: tf-verify-state
+tf-verify-state: ## Fail if expected Terraform state resources are missing.
+	@printf '$(CYAN)%s$(RESET)\n' "Verifying Terraform state for $(TF_ENV)..."
+	@set -e; \
+	cd $(TF_DIR); \
+	state="$$(terraform state list)"; \
+	for addr in $(EXPECTED_STATE); do \
+		echo "$$state" | grep -qx "$$addr" || { \
+			printf '$(RED)%s$(RESET)\n' "Missing expected state resource: $$addr"; \
+			exit 1; \
+		}; \
+	done; \
+	printf '$(GREEN)%s$(RESET)\n' "All expected state resources are present."
+
+.PHONY: tf-verify-post-apply
+tf-verify-post-apply: tf-verify-output tf-verify-state ## Verify outputs and state after apply.
+	@printf '$(GREEN)%s$(RESET)\n' "Post-apply verification passed for $(TF_ENV)."
+
+
+IMPORT_ADDRESS ?=
+IMPORT_ID ?=
+
+.PHONY: tf-import
+tf-import: tf-check-env-specific-tf-dir-as-tf-root-module
+	@if [ -z "$(IMPORT_ADDRESS)" ]; then \
+		printf '$(RED)%s$(RESET)\n' "ERROR: IMPORT_ADDRESS is required."; \
+		exit 1; \
+	fi
+	@if [ -z "$(IMPORT_ID)" ]; then \
+		printf '$(RED)%s$(RESET)\n' "ERROR: IMPORT_ID is required."; \
+		exit 1; \
+	fi
+	@printf '$(YELLOW)%s$(RESET)\n' "Importing $(IMPORT_ADDRESS) into $(TF_ENV)..."
+	cd $(TF_DIR) && terraform import "$(IMPORT_ADDRESS)" "$(IMPORT_ID)"
+
+
+.PHONY: tf-destroy
+tf-destroy: ## Destroy the selected environment using terraform.tfvars.
+	@printf '$(CYAN)%s$(RESET)\n' "Destroying Terraform in $(TF_DIR)..."
+	cd $(TF_DIR) && terraform destroy -var-file=terraform.tfvars
+
+# ------------------------------------------------------------------------------------------------------------------------------------
+# 												Why tf-clean is destructive? 
+# ------------------------------------------------------------------------------------------------------------------------------------
+#	It is not just cleaning temporary files. It is resetting Terraform’s identity and history.
+# 		Provider cache removed (.terraform)       			→ terraform init required
+# 		Lock file removed (.terraform.lock.hcl)           	→ provider selections may be recalculated
+# 		State removed (terraform.tfstate)               	→ Terraform forgets managed resources
+# 		Backup state removed  (terraform.tfstate.backup)    → recovery copy deleted
+#
+# What happens when state is deleted?
+# 	Suppose Terraform previously created:
+# 		module.network.random_pet.vpc_name
+# 		module.network.random_id.vpc_id
+# 		module.network.local_file.network_manifest
+# 		module.cluster.random_pet.cluster_name
+# 		module.cluster.local_file.cluster_manifest
+
+# 	The state file remembers these resource addresses and their current IDs/attributes.
+
+# 	For example, conceptually:
+# 		Terraform address:
+# 		module.network.random_id.vpc_id
+
+# 		Known object:
+# 		random ID = "a1b2c3d4"
+
+# 	If you delete terraform.tfstate, the actual generated files may still exist, but Terraform no longer knows that it created them.
+
+# 	The result is:
+# 		Configuration still exists
+# 		Actual files may still exist
+# 		Terraform state mapping is gone
+# 		Terraform now treats the resources as unmanaged or new.
+
+# 	Deleting state does not automatically delete the real resources.
+
+# 	That is the critical distinction:
+# 		terraform destroy:
+# 			Deletes resources and updates state
+
+# 		delete terraform.tfstate:
+# 			Deletes Terraform's memory but leaves resources behind
+# 			This can create orphaned resources.
+#
+#	Difference between deleting .terraform and deleting state
+#  -----------------------------------------------------------
+# These two operations are different.
+# 	Deleting .terraform							|		Deleting terraform.tfstate
+# 	> rm -rf .terraform							| 		> rm terraform.tfstate
+# 	Removes:								    | 		Removes:
+# 	  - Downloaded provider binaries.           |   		- Resource-to-object mappings.
+# 	  - Module cache.							|  			- Stored IDs.
+# 	  - Local initialization metadata.			|  			- Stored attributes. 
+# 	Afterward, run:								|  			- Dependency metadata.
+# 	> terraform init							|  			- Terraform’s record of managed resources.
+# 	- Your state can still remain intact.		|  			- This is much more serious.
+# 	- This is generally recoverable.            |
+# ------------------------------------------------------------------------------------------------------
+# Note: For your zero-cost local lab, this is safe only because the resources are disposable local files and generated values.
+#	    For AWS or production infrastructure, never casually run a target that deletes state.
+# ------------------------------------------------------------------------------------------------------------------------------------
+.PHONY: tf-clean-force
+tf-clean-force: ## Remove Terraform working files for the selected environment.
+	@printf '$(CYAN)%s$(RESET)\n' "Cleaning Terraform working files for $(TF_ENV)..."
+	cd $(TF_DIR) && rm -rf .terraform .terraform.lock.hcl terraform.tfstate terraform.tfstate.backup
+	@printf '$(GREEN)%s$(RESET)\n' "Terraform working files cleaned."

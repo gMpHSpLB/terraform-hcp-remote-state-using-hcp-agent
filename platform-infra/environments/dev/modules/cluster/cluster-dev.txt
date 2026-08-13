@@ -1,0 +1,5 @@
+env_name         = dev
+cluster_name     = dev-cluster-stunning-squid
+vpc_id           = 3eb69d9c
+private_subnet_ids = 3eb69d9c-subnet-a, 3eb69d9c-subnet-b
+node_count         = 4

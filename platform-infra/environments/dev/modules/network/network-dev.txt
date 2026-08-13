@@ -1,0 +1,4 @@
+env_name   = dev
+vpc_name   = dev-vpc-regular-goshawk
+vpc_id     = 3eb69d9c
+vpc_cidr   = 10.0.0.0/15
